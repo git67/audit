@@ -9,28 +9,21 @@ SCRIPT_NAME="$(basename "$0")"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 DO_APT=1
 DO_BINARIES=0
-DO_FALCO=0
 DO_DOCKER_SCOUT=0
-UNINSTALL=0
 DRY_RUN=0
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--skip-apt] [--all] [--falco] [--docker-scout] [--uninstall] [--bin-dir DIR] [--dry-run]
+Usage: $SCRIPT_NAME [--skip-apt] [--all] [--docker-scout] [--bin-dir DIR] [--dry-run]
 
-Installiert (oder entfernt mit --uninstall) die optionalen Kommandos, die von
-Audit-Docker-Debian.sh referenziert werden. --uninstall kehrt die unten
-angegebenen Auswahl-Flags um; daher dieselben Flags wie bei der Installation verwenden.
+Installiert die optionalen Kommandos, die von Audit-Docker-Debian.sh referenziert werden.
 
-  (Standard)       APT-Pakete installieren/entfernen: jq git curl iproute2 lsof
+  (Standard)       APT-Pakete installieren: jq git curl iproute2 lsof
                     bsdextrautils lynis shellcheck yamllint apparmor-utils auditd
-  --skip-apt       APT-Pakete nicht installieren/entfernen
-  --all            Zusaetzlich Scanner-/Signier-Binaries installieren/entfernen: trivy syft
+  --skip-apt       APT-Pakete nicht installieren
+  --all            Zusaetzlich Scanner-/Signier-Binaries installieren: trivy syft
                     grype hadolint cosign crane notation
-  --falco          Zusaetzlich das Falco-APT-Repository und -Paket hinzufuegen/entfernen
-                    (aendert APT-Quellen; installiert einen Kernel-/eBPF-Treiber)
-  --docker-scout   Zusaetzlich das Docker-Scout-CLI-Plugin fuer den aktuellen Benutzer installieren/entfernen
-  --uninstall      Entfernen statt installieren
+  --docker-scout   Zusaetzlich das Docker-Scout-CLI-Plugin fuer den aktuellen Benutzer installieren
   --bin-dir DIR    Zielverzeichnis fuer heruntergeladene Binaerdateien (Standard: $BIN_DIR)
   --dry-run        Aktionen nur anzeigen, ohne sie auszufuehren
 EOF
@@ -40,9 +33,7 @@ while (($# > 0)); do
   case "$1" in
     --skip-apt) DO_APT=0 ;;
     --all) DO_BINARIES=1 ;;
-    --falco) DO_FALCO=1 ;;
     --docker-scout) DO_DOCKER_SCOUT=1 ;;
-    --uninstall) UNINSTALL=1 ;;
     --bin-dir)
       shift
       (($# > 0)) || { echo "Fehlender Wert fuer --bin-dir" >&2; exit 2; }
@@ -209,21 +200,6 @@ install_binaries() {
   install_binary_release notation notaryproject/notation "notation_.*_linux_${arch}\.tar\.gz$" tar.gz
 }
 
-install_falco() {
-  if have falco; then
-    log "falco bereits installiert"
-    return 0
-  fi
-  log "Fuege das Falco-APT-Repository hinzu und installiere falco"
-  as_root bash -c '
-    set -e
-    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" > /etc/apt/sources.list.d/falcosecurity.list
-    apt-get update
-    apt-get install -y falco
-  '
-}
-
 install_docker_scout() {
   if docker scout version >/dev/null 2>&1; then
     log "Docker-Scout-CLI-Plugin bereits installiert"
@@ -233,87 +209,12 @@ install_docker_scout() {
   act bash -c 'curl -fsSL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh | sh -s --'
 }
 
-uninstall_apt_packages() {
-  local pairs=(jq:jq git:git curl:curl iproute2:ss lsof:lsof
-    lynis:lynis shellcheck:shellcheck yamllint:yamllint apparmor-utils:aa-status auditd:auditctl)
-  local package command_name present=()
-  for pair in "${pairs[@]}"; do
-    package="${pair%%:*}"
-    command_name="${pair##*:}"
-    have "$command_name" && present+=("$package")
-  done
-  if have column; then
-    local column_pkg
-    column_pkg=$(dpkg -S "$(command -v column)" 2>/dev/null | cut -d: -f1 | head -n1)
-    [[ -n "$column_pkg" ]] && present+=("$column_pkg")
-  fi
-  if ((${#present[@]} == 0)); then
-    log "APT-Pakete bereits entfernt"
-    return 0
-  fi
-  log "Entferne APT-Pakete: ${present[*]}"
-  as_root apt-get purge -y "${present[@]}"
-  as_root apt-get autoremove -y
-}
-
-# Loescht Binaerdateien nur unterhalb von BIN_DIR; per Paketmanager installierte Versionen an anderer Stelle bleiben unangetastet.
-uninstall_binary() {
-  local name="$1" path
-  path=$(command -v "$name" 2>/dev/null || true)
-  if [[ -z "$path" ]]; then
-    log "$name bereits nicht vorhanden"
-    return 0
-  fi
-  case "$path" in
-    "$BIN_DIR"/*)
-      log "Entferne $path"
-      as_root rm -f "$path"
-      ;;
-    *) log "Ueberspringe $name: ausserhalb von $BIN_DIR installiert ($path); bei Bedarf manuell entfernen" ;;
-  esac
-}
-
-uninstall_binaries() {
-  for name in trivy syft grype hadolint cosign crane notation; do
-    uninstall_binary "$name"
-  done
-}
-
-uninstall_falco() {
-  if ! have falco && [[ ! -f /etc/apt/sources.list.d/falcosecurity.list ]]; then
-    log "falco bereits nicht vorhanden"
-    return 0
-  fi
-  log "Entferne falco und dessen APT-Repository"
-  as_root apt-get purge -y falco || true
-  as_root rm -f /etc/apt/sources.list.d/falcosecurity.list /usr/share/keyrings/falco-archive-keyring.gpg
-  as_root apt-get update
-}
-
-uninstall_docker_scout() {
-  local plugin_path="$HOME/.docker/cli-plugins/docker-scout"
-  if [[ ! -e "$plugin_path" ]]; then
-    log "Docker-Scout-CLI-Plugin bereits nicht vorhanden"
-    return 0
-  fi
-  log "Entferne Docker-Scout-CLI-Plugin"
-  act rm -f "$plugin_path"
-}
-
-if ((UNINSTALL)); then
-  ((DO_APT)) && uninstall_apt_packages
-  ((DO_BINARIES)) && uninstall_binaries
-  ((DO_FALCO)) && uninstall_falco
-  ((DO_DOCKER_SCOUT)) && uninstall_docker_scout
-else
-  ((DO_APT)) && install_apt_packages
-  ((DO_BINARIES)) && install_binaries
-  ((DO_FALCO)) && install_falco
-  ((DO_DOCKER_SCOUT)) && install_docker_scout
-fi
+((DO_APT)) && install_apt_packages
+((DO_BINARIES)) && install_binaries
+((DO_DOCKER_SCOUT)) && install_docker_scout
 
 log "Verfuegbarkeit der Tools:"
-for command_name in jq git curl ss lsof column lynis shellcheck yamllint skopeo trivy syft grype hadolint cosign crane notation aa-status auditctl falco; do
+for command_name in jq git curl ss lsof column lynis shellcheck yamllint skopeo trivy syft grype hadolint cosign crane notation aa-status auditctl; do
   printf '%-24s ' "$command_name"
   have "$command_name" && command -v "$command_name" || echo "nicht gefunden"
 done
